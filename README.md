@@ -1,4 +1,4 @@
-# Schema.org Class & Property Extraction (Refactored)
+# Schema.org Class & Property Extraction
 
 Explore the Schema.org vocabulary against your own RDF dataset. This tool:
 - Parses the Schema.org JSON-LD to capture class/property hierarchies and ranges.
@@ -25,8 +25,8 @@ Explore the Schema.org vocabulary against your own RDF dataset. This tool:
 3. **Run the script** (adjust paths and flags as needed):
 
 ```bash
-python yago_schema_with_value_preprocess_refactored.py \
-  --jsonld RFDs/schemaorg-current-https.jsonld \
+python notebooks/yago_schema_with_value_preprocessing.py \
+  --jsonld schemaorg-current-https.jsonld \
   --endpoint http://localhost:7878/query \
   --out partial_results.json \
   --out-prefixed partial_results_prefixed.json
