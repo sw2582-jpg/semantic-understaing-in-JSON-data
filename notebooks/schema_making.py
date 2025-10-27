@@ -3,39 +3,47 @@
 Schema Maker (Refactored)
 =========================
 
-Features
---------
-1) Parse Schema.org JSON-LD: classes, properties, domainIncludes, rangeIncludes
-2) Generate randomized JSON Schemas centered on classes that have instances
-3) Optionally fill generated schemas with instance URIs from a SPARQL endpoint
-   (default: YAGO public endpoint, but you can point to localhost)
+This script generates random JSON Schemas centered on Schema.org classes that
+are known to have instances in your RDF dataset. It can optionally fill
+generated schemas with instance URIs from a SPARQL endpoint. The aim is
+to provide a reproducible and configurable way to create a set of example
+schemas based on the Schema.org vocabulary and the data actually present
+in your triple store.
 
-Usage
------
-# 1) Generate schemas (no fill), saving incremental results:
+Key Features
+------------
+* Parses a Schema.org JSON‑LD file to build class and property hierarchies,
+  as well as domain and range relationships for properties.
+* Accepts a mapping of Schema.org classes to the number of instances
+  present in your dataset (e.g., produced by the preprocessing script).
+* Randomly selects classes with instances and properties with appropriate
+  ranges to build each schema. You can control the number of properties and
+  the maximum depth of nested objects.
+* Optionally fills the generated schemas with real instance URIs drawn
+  from a SPARQL endpoint, allowing you to see what actual data might look like.
+* All paths and parameters are provided via command‑line arguments.
+
+Example Usage
+-------------
+```
+# Generate 10 random schemas without filling values
 python schema_making.py \
   --jsonld RFDs/schemaorg-current-https.jsonld \
   --schemas-with-instances schemas_with_instances.json \
   --num-schemas 10 \
-  --out generated_schemas.json \
-  --seed 42
+  --out generated_schemas.json
 
-# 2) Generate and then fill with URIs (SPARQL):
-python schema_making_refactored.py \
+# Generate 5 schemas and fill them with URIs using a local SPARQL endpoint
+python schema_making.py \
   --jsonld RFDs/schemaorg-current-https.jsonld \
   --schemas-with-instances schemas_with_instances.json \
   --num-schemas 5 \
   --out generated_schemas.json \
   --fill-out filled_schemas.json \
-  --endpoint http://localhost:7878/query \
-  --seed 7
+  --endpoint http://localhost:7878/query
+```
 
-IMPORTANT
----------
-- If you use a localhost endpoint (e.g., http://localhost:7878/query),
-  be sure your triple-store is running locally and is loaded with data.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -45,53 +53,35 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
-# Optional import for SPARQL filling; only required if --fill-out is used
 try:
-    import requests  # noqa: F401
+    import requests  # type: ignore
 except Exception:
     requests = None
 
 
-# =========================
-# JSON-LD parsing utilities
-# =========================
 def parse_jsonld_hierarchy(jsonld_path: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Parse a Schema.org JSON-LD file to extract:
-      - classes: name -> parents (str | list[str] | None)
-      - properties: property -> parents
-      - property_class_relations: property -> [domainIncludes...]
-      - property_ranges: property -> [rangeIncludes...]
+    """Parse a Schema.org JSON‑LD file to extract class and property hierarchies.
 
-    Parameters
-    ----------
-    jsonld_path : str
-        Path to Schema.org JSON-LD file.
-
-    Returns
-    -------
-    dict
-        {
-          "classes": {...},
-          "properties": {...},
-          "property_class_relations": {...},
-          "property_ranges": {...}
-        }
+    The returned dictionary contains four keys:
+      - ``classes``: mapping of class IRI to parent class or list of parents.
+      - ``properties``: mapping of property IRI to parent property or list of parents.
+      - ``property_class_relations``: mapping of property IRI to domain classes.
+      - ``property_ranges``: mapping of property IRI to range classes.
     """
-    def extract_hierarchy(items, type_filter: str, subclass_key: str, hierarchy: Dict[str, Any]):
+    def extract_hierarchy(items, type_filter: str, subclass_key: str, dest: Dict[str, Any]):
         for item in items:
             if "@type" in item and type_filter in item["@type"]:
-                name = item.get("@id")
+                iri = item.get("@id")
                 parents = item.get(subclass_key)
                 if isinstance(parents, dict):
-                    hierarchy[name] = parents.get("@id")
+                    dest[iri] = parents.get("@id")
                 elif isinstance(parents, list):
-                    hierarchy[name] = [p.get("@id") for p in parents if isinstance(p, dict) and "@id" in p]
+                    dest[iri] = [p.get("@id") for p in parents if isinstance(p, dict) and "@id" in p]
                 else:
-                    hierarchy[name] = None
+                    dest[iri] = None
 
-    def extract_property_relations(items, field: str) -> Dict[str, List[str]]:
-        rel = {}
+    def extract_rel(items, field: str) -> Dict[str, List[str]]:
+        rel: Dict[str, List[str]] = {}
         for item in items:
             if "@type" in item and "Property" in item["@type"]:
                 prop = item.get("@id")
@@ -104,16 +94,13 @@ def parse_jsonld_hierarchy(jsonld_path: str) -> Dict[str, Dict[str, Any]]:
 
     with open(jsonld_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-
-    g = data.get("@graph", [])
-    classes = {}
-    properties = {}
-
-    extract_hierarchy(g, "Class", "rdfs:subClassOf", classes)
-    extract_hierarchy(g, "Property", "rdfs:subPropertyOf", properties)
-    property_class_relations = extract_property_relations(g, "schema:domainIncludes")
-    property_ranges = extract_property_relations(g, "schema:rangeIncludes")
-
+    graph = data.get("@graph", [])
+    classes: Dict[str, Any] = {}
+    properties: Dict[str, Any] = {}
+    extract_hierarchy(graph, "Class", "rdfs:subClassOf", classes)
+    extract_hierarchy(graph, "Property", "rdfs:subPropertyOf", properties)
+    property_class_relations = extract_rel(graph, "schema:domainIncludes")
+    property_ranges = extract_rel(graph, "schema:rangeIncludes")
     return {
         "classes": classes,
         "properties": properties,
@@ -122,9 +109,6 @@ def parse_jsonld_hierarchy(jsonld_path: str) -> Dict[str, Dict[str, Any]]:
     }
 
 
-# ======================
-# Schema generation core
-# ======================
 DEFAULT_STOP_CLASSES = {"Thing", "Place", "QuantitativeValue", "QualitativeValue", "Date"}
 STATIC_OVERRIDES = {"name": "string", "description": "string", "identifier": "string"}
 NO_EXPAND_PROPS = {"description"}
@@ -132,9 +116,10 @@ NO_EXPAND_PROPS = {"description"}
 
 @dataclass
 class SchemaGenConfig:
+    """Configuration settings for the JSON schema generator."""
     hierarchy: Dict[str, Dict[str, Any]]
     schemas_with_instances: Dict[str, int]
-    stop_classes: set = None
+    stop_classes: set | None = None
     max_depth: int = 2
     seed: Optional[int] = None
 
@@ -146,130 +131,102 @@ class SchemaGenConfig:
 
 
 class JSONSchemaGenerator:
-    """
-    Generate randomized JSON Schemas centered on classes known to have instances
-    (as indicated by `schemas_with_instances`).
-    """
+    """Generate random JSON Schemas centered on classes with instances."""
     def __init__(self, cfg: SchemaGenConfig):
         self.cfg = cfg
 
-    # ---- Helpers ----
     def _select_central_class(self) -> str:
         classes = list(self.cfg.schemas_with_instances.keys())
         if not classes:
-            raise ValueError("No classes with instances are available.")
+            raise ValueError("No classes with instances are available for schema generation.")
         return random.choice(classes)
 
     def _relevant_properties(self, central_class: str, min_properties: int) -> List[str]:
-        """
-        Collect a list of properties relevant to `central_class` (and ancestors),
-        ensuring property ranges include at least one class that has instances.
-        """
+        """Collect a list of candidate properties for a given central class."""
         props: List[str] = []
         visited: set = set()
-
-        cc = central_class if central_class.startswith("schema:") else f"schema:{central_class}"
-
-        while cc and len(props) < min_properties:
-            if cc in visited or cc in self.cfg.stop_classes:
+        current = central_class if central_class.startswith("schema:") else f"schema:{central_class}"
+        while current and len(props) < min_properties:
+            if current in visited or current.split(":")[-1] in self.cfg.stop_classes:
                 break
-            visited.add(cc)
-
-            current = [
-                prop for prop, domains in self.cfg.hierarchy["property_class_relations"].items()
-                if cc in domains
+            visited.add(current)
+            current_props = [
+                p for p, domains in self.cfg.hierarchy["property_class_relations"].items() if current in domains
             ]
-
-            valid = []
-            for p in current:
+            valid: List[str] = []
+            for p in current_props:
                 ranges = self.cfg.hierarchy["property_ranges"].get(p, [])
                 if any(rt in self.cfg.schemas_with_instances for rt in ranges):
                     valid.append(p)
-
             random.shuffle(valid)
             props.extend(valid)
-            props = list(dict.fromkeys(props))  # stable dedupe
-
-            parents = self.cfg.hierarchy["classes"].get(cc)
-            if isinstance(parents, list):
-                cc = random.choice(parents) if parents else None
+            # deduplicate while preserving order
+            props = list(dict.fromkeys(props))
+            parents = self.cfg.hierarchy["classes"].get(current)
+            if isinstance(parents, list) and parents:
+                current = random.choice(parents)
             else:
-                cc = parents
-
+                current = parents
         if len(props) < min_properties:
             fillers = ["name", "description", "identifier"]
             random.shuffle(fillers)
-            props.extend(fillers[: min_properties - len(props)])
-
+            for f in fillers:
+                if f not in props:
+                    props.append(f)
+                if len(props) >= min_properties:
+                    break
         random.shuffle(props)
         return props[:min_properties]
 
     def _prop_definition(self, prop: str, current_depth: int) -> Dict[str, Any]:
-        # static overrides
         if prop in STATIC_OVERRIDES:
             return {"type": STATIC_OVERRIDES[prop]}
-
         ranges = self.cfg.hierarchy["property_ranges"].get(prop, [])
-        if ranges:
-            chosen_type = random.choice(ranges).split(":")[-1]
-        else:
-            chosen_type = "string"
-
+        chosen_type = random.choice(ranges).split(":")[-1] if ranges else "string"
         if prop in NO_EXPAND_PROPS or chosen_type in self.cfg.stop_classes:
             return {"type": chosen_type}
-
-        # Expand complex types into nested objects, up to max_depth
+        # Expand nested objects
         if chosen_type not in {"string", "Number", "boolean", "array", "URL", "Text"} and current_depth < self.cfg.max_depth:
-            nested = self.generate_schema(
-                num_properties=max(2, random.randint(2, 4)),
-                central_class=chosen_type,
-                current_depth=current_depth + 1,
-            )
-            # cosmetic hint for nested objects:
+            nested = self.generate_schema(num_properties=max(2, random.randint(2, 4)), central_class=chosen_type, current_depth=current_depth + 1)
+            # Add a name placeholder for nested objects
             nested["properties"]["name"] = {"type": "name_of_object"}
             return {"type": "object", "properties": nested["properties"]}
         return {"type": chosen_type}
 
-    # ---- Public API ----
     def generate_schema(self, num_properties: int, central_class: Optional[str] = None, current_depth: int = 0) -> Dict[str, Any]:
         if not central_class:
             central_class = self._select_central_class()
         props = self._relevant_properties(central_class, num_properties)
-
-        schema = {
+        schema: Dict[str, Any] = {
             "$schema": "http://json-schema.org/schema#",
             "title": central_class if central_class.startswith("schema:") else f"schema:{central_class}",
             "type": "object",
             "properties": {},
             "required": [],
         }
-
         for p in props:
-            clean = p.split(":")[-1]
-            schema["properties"][clean] = self._prop_definition(p, current_depth)
-            # randomly mark required
+            key = p.split(":")[-1]
+            schema["properties"][key] = self._prop_definition(p, current_depth)
             if random.choice([True, False]):
-                schema["required"].append(clean)
-
+                schema["required"].append(key)
         schema["required"] = sorted(set(schema["required"]))
         return schema
 
 
-# ===============================
-# SPARQL-backed value filler (opt)
-# ===============================
+# ----------------------------
+# SPARQL helper for filling
+# ----------------------------
+
 DEFAULT_ENDPOINT = "https://yago-knowledge.org/sparql/query"
+
 
 def _require_requests():
     if requests is None:
-        raise RuntimeError("The 'requests' library is required for SPARQL filling. Install it or omit --fill-out.")
+        raise RuntimeError("The 'requests' library is required for SPARQL operations. Install it or omit --fill-out.")
 
 
 def query_instances_for_type(schema_type: str, endpoint: str, limit: int = 100) -> List[str]:
-    """
-    Query SPARQL endpoint for ?instance a schema:<schema_type>.
-    Returns a list of URIs.
-    """
+    """Query the SPARQL endpoint for distinct instance URIs of a given schema type."""
     _require_requests()
     sparql = f"""
     PREFIX schema: <http://schema.org/>
@@ -279,86 +236,63 @@ def query_instances_for_type(schema_type: str, endpoint: str, limit: int = 100) 
     }}
     LIMIT {limit}
     """
-    headers = {"Content-Type": "application/sparql-query", "Accept": "application/sparql-results+json"}
+    headers = {
+        "Content-Type": "application/sparql-query",
+        "Accept": "application/sparql-results+json",
+    }
     try:
         resp = requests.post(endpoint, data=sparql, headers=headers, timeout=60)
         if not resp.ok:
             return []
         data = resp.json()
-        out = []
-        for b in data.get("results", {}).get("bindings", []):
-            uri = b.get("instance", {}).get("value")
-            if uri:
-                out.append(uri)
-        return out
+        return [b["instance"]["value"] for b in data.get("results", {}).get("bindings", []) if "instance" in b]
     except Exception:
         return []
 
 
 def fill_schema_values(schema_def: Dict[str, Any], endpoint: str) -> Any:
-    """
-    Recursively fill a generated schema with instance URIs.
-    - For "object" types, recurse into properties.
-    - For leaf types (e.g., CreativeWork, URL, Text), fetch a random instance.
-    """
+    """Recursively fill a generated schema with instance URIs from a SPARQL endpoint."""
     t = schema_def.get("type")
     if t == "object":
         return {k: fill_schema_values(v, endpoint) for k, v in schema_def.get("properties", {}).items()}
     if t:
-        # Note: many Schema.org types won't return instances on your dataset;
-        # this function will fall back to a stub string if none found.
         candidates = query_instances_for_type(t, endpoint=endpoint, limit=100)
         return random.choice(candidates) if candidates else f"NoInstanceFoundFor_{t}"
     return "NoTypeSpecified"
 
 
-# ============
-# I/O helpers
-# ============
-def read_json(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ----------------------------
+# CLI Implementation
+# ----------------------------
 
-
-def write_json(path: str, data: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-# ============
-# CLI
-# ============
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Schema Maker (refactored)")
-    p.add_argument("--jsonld", required=True, help="Path to Schema.org JSON-LD (e.g., schemaorg-current-https.jsonld)")
-    p.add_argument("--schemas-with-instances", required=True,
-                   help="JSON mapping { schema:Class -> instance_count }. Used to pick central classes.")
-    p.add_argument("--num-schemas", type=int, default=10, help="How many schemas to generate")
-    p.add_argument("--out", required=True, help="Where to write generated schemas (JSON list)")
-    p.add_argument("--max-depth", type=int, default=2, help="Max nested object expansion depth")
+    p = argparse.ArgumentParser(description="Generate random JSON Schemas from Schema.org classes")
+    p.add_argument("--jsonld", required=True, help="Path to the Schema.org JSON‑LD file")
+    p.add_argument("--schemas-with-instances", required=True, help="JSON mapping {schema:Class -> count} from preprocessing")
+    p.add_argument("--num-schemas", type=int, default=10, help="Number of schemas to generate")
+    p.add_argument("--out", required=True, help="Output path for generated schemas (JSON list)")
+    p.add_argument("--max-depth", type=int, default=2, help="Maximum nested object depth")
     p.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
-
     # Optional filling
-    p.add_argument("--fill-out", help="If set, write a filled version of the schemas here")
-    p.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
-                   help=f"SPARQL endpoint for filling (default: {DEFAULT_ENDPOINT}). "
-                        "If you use localhost (e.g., http://localhost:7878/query), ensure your triple-store is running.")
+    p.add_argument("--fill-out", help="If specified, write a filled version of schemas here")
+    p.add_argument(
+        "--endpoint",
+        default=DEFAULT_ENDPOINT,
+        help=f"SPARQL endpoint for filling. Default: {DEFAULT_ENDPOINT}. If you use localhost (e.g., http://localhost:7878/query), ensure your triple store is running.",
+    )
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
-
-    # Friendly reminder about localhost usage
+    # Friendly reminder for localhost
     if "localhost" in args.endpoint or "127.0.0.1" in args.endpoint:
-        print("[Reminder] You're using a localhost endpoint. Make sure your triple-store is running and loaded.")
-
-    # 1) Parse Schema.org JSON-LD
+        print("[Reminder] You're using a localhost endpoint. Ensure your triple store is running and loaded.")
+    # 1) Parse hierarchy
     hierarchy = parse_jsonld_hierarchy(args.jsonld)
-
-    # 2) Load {schema:Class -> count} for picking central classes
-    schemas_with_instances = read_json(args.schemas_with_instances)
-
+    # 2) Load class instance counts
+    with open(args.schemas_with_instances, "r", encoding="utf-8") as f:
+        schemas_with_instances = json.load(f)
     # 3) Generate schemas
     cfg = SchemaGenConfig(
         hierarchy=hierarchy,
@@ -367,26 +301,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         seed=args.seed,
     )
     gen = JSONSchemaGenerator(cfg)
-
-    out_schemas: List[Dict[str, Any]] = []
+    schemas: List[Dict[str, Any]] = []
     for _ in range(args.num_schemas):
         num_props = random.randint(2, 5)
-        out_schemas.append(gen.generate_schema(num_properties=num_props))
-
-    write_json(args.out, out_schemas)
-    print(f"[OK] Wrote {len(out_schemas)} schemas -> {args.out}")
-
-    # 4) Optionally fill schemas via SPARQL
+        schemas.append(gen.generate_schema(num_properties=num_props))
+    # Write schemas
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(schemas, f, indent=2)
+    print(f"[OK] Wrote {len(schemas)} schemas -> {args.out}")
+    # 4) Optionally fill
     if args.fill_out:
         if requests is None:
-            print("[WARN] 'requests' not installed; cannot fill schemas. Skipping.")
+            print("[WARN] requests library not available; cannot fill schemas. Skipping.")
         else:
-            filled = []
-            for sch in out_schemas:
-                filled.append(fill_schema_values(sch, endpoint=args.endpoint))
-            write_json(args.fill_out, filled)
+            filled = [fill_schema_values(s, args.endpoint) for s in schemas]
+            with open(args.fill_out, "w", encoding="utf-8") as f:
+                json.dump(filled, f, indent=2)
             print(f"[OK] Wrote filled schemas -> {args.fill_out}")
-
     return 0
 
 

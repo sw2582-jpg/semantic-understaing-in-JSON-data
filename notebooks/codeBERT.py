@@ -3,35 +3,46 @@
 CodeBERT Feature Extraction (Refactored)
 =======================================
 
-Extract fixed-size embeddings from text values using CodeBERT (RoBERTa).
-- Loads texts from a CSV (choose the column).
-- Batches through the model with mean/CLS pooling.
-- Saves embeddings to .npy (or .pt) with a metadata sidecar.
+This script extracts fixed‑length embeddings from a column of text in a CSV
+using a pre‑trained CodeBERT (RoBERTa) model. It is designed to be simple
+to use from the command line and flexible enough for a variety of
+workflows. The script accepts several parameters to control how the
+embeddings are computed, including the model name, device selection,
+batch size, maximum sequence length, and pooling strategy.
 
-Examples
---------
-# Basic: read 'values_concat' from CSV and write embeddings.npy
-python codebert_features.py \
+Key Features
+------------
+* Reads text values from a specified column in a CSV file.
+* Uses HuggingFace's Transformers library to load a CodeBERT model and
+  tokenizer.
+* Supports mean pooling or CLS token pooling to obtain a single
+  vector per input.
+* Allows specifying the compute device (CPU/GPU) and enabling fp16 on CUDA.
+* Saves the resulting embeddings to a NumPy `.npy` file or a PyTorch
+  `.pt` tensor file.
+* Writes a side‑car JSON file containing metadata about the run (e.g.,
+  model name, number of rows, embedding dimension).
+
+Example Usage
+-------------
+```
+# Extract embeddings from the 'values_concat' column of col_yago_train.csv
+# and save as train_embeddings.npy along with train_embeddings.meta.json
+python codebert.py \
   --input col_yago_train.csv \
   --text-col values_concat \
-  --out embeddings_train.npy
+  --out train_embeddings.npy
 
-# Change batch size / max length / pooling, save as .pt
-python codebert_features.py \
+# Extract embeddings using CLS pooling and a shorter max sequence length
+python codebert.py \
   --input col_yago_test.csv \
   --text-col values_concat \
-  --out embeddings_test.pt \
+  --out test_embeddings.pt \
   --pooling cls \
-  --batch-size 32 \
-  --max-len 128
+  --max-len 128 \
+  --batch-size 32
+```
 
-# Select model and device explicitly
-python codebert_features.py \
-  --input col_yago_train.csv \
-  --text-col values_concat \
-  --out train.npy \
-  --model microsoft/codebert-base \
-  --device cuda
 """
 from __future__ import annotations
 
@@ -39,36 +50,43 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Iterable, List, Tuple, Optional
+from typing import Iterable, List, Optional
 
-import numpy as np
-import torch
-from transformers import AutoTokenizer, AutoModel
-from tqdm import tqdm
+import numpy as np  # type: ignore
+import torch  # type: ignore
+from transformers import AutoTokenizer, AutoModel  # type: ignore
+from tqdm import tqdm  # type: ignore
 
 
-# --------------------------
-# Pooling & embedding helpers
-# --------------------------
 def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Mean‑pool token embeddings across the sequence length.
+
+    Parameters
+    ----------
+    last_hidden_state : torch.Tensor
+        The hidden states returned from the transformer model of shape
+        ``[batch_size, sequence_length, hidden_size]``.
+    attention_mask : torch.Tensor
+        A tensor of shape ``[batch_size, sequence_length]`` indicating which
+        tokens are real (1) versus padding (0).
+
+    Returns
+    -------
+    torch.Tensor
+        A tensor of shape ``[batch_size, hidden_size]`` containing the
+        mean‑pooled embeddings.
     """
-    Mean-pool token embeddings using the attention mask.
-    last_hidden_state: [B, T, H]
-    attention_mask:    [B, T]
-    returns:           [B, H]
-    """
+    # Expand attention_mask to match the last_hidden_state shape
     mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+    # Sum the hidden states where mask == 1
     summed = (last_hidden_state * mask).sum(dim=1)
+    # Count the number of valid tokens to avoid dividing by zero
     counts = mask.sum(dim=1).clamp(min=1e-9)
     return summed / counts
 
 
 def cls_pool(last_hidden_state: torch.Tensor) -> torch.Tensor:
-    """
-    Return the <s> (CLS) embedding at position 0 for each sequence.
-    last_hidden_state: [B, T, H]
-    returns:           [B, H]
-    """
+    """Return the embeddings from the CLS token (first token) of each sequence."""
     return last_hidden_state[:, 0, :]
 
 
@@ -81,40 +99,56 @@ def codebert_embed(
     pooling: str = "mean",
     fp16: bool = False,
 ) -> np.ndarray:
-    """
-    Compute embeddings for a list/iterable of strings using CodeBERT.
+    """Compute embeddings for a collection of strings using CodeBERT.
+
+    This function lazily batches the provided iterable of texts and passes
+    them through the transformer model. It then applies the chosen pooling
+    strategy to obtain a single embedding per input string.
 
     Parameters
     ----------
     texts : Iterable[str]
-    model_name : str
-        HF model id (default: microsoft/codebert-base)
-    device : {"auto","cpu","cuda"}
-    batch_size : int
-    max_len : int
-    pooling : {"mean","cls"}
-    fp16 : bool
-        If True and device is CUDA, run the model in float16.
+        An iterable of texts to embed.
+    model_name : str, optional
+        The HuggingFace model identifier to load. Defaults to
+        ``microsoft/codebert-base``.
+    device : str, optional
+        Which device to run on: ``"auto"`` selects CUDA if available,
+        otherwise CPU. You can also explicitly set ``"cpu"`` or ``"cuda"``.
+    batch_size : int, optional
+        The number of texts per inference batch. Defaults to 64.
+    max_len : int, optional
+        Maximum length in tokens for truncation/padding. Defaults to 256.
+    pooling : str, optional
+        Pooling strategy: ``"mean"`` or ``"cls"``. Defaults to ``"mean"``.
+    fp16 : bool, optional
+        If True and a CUDA device is selected, perform inference in
+        half precision (fp16). Defaults to False.
 
     Returns
     -------
-    np.ndarray of shape [N, H]
+    np.ndarray
+        A NumPy array of shape ``[num_texts, hidden_size]`` containing the
+        embeddings.
     """
-    texts = ["" if t is None else str(t) for t in texts]
+    # Normalize the input texts (replace None with empty strings)
+    text_list = ["" if t is None else str(t) for t in texts]
 
     # Resolve device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
     model.to(device)
     model.eval()
 
+    # Optionally cast model to half precision
     if fp16 and device == "cuda":
         model.half()
 
-    # Choose pooling function
+    # Select pooling function
     if pooling == "mean":
         pool_fn = lambda out, mask: mean_pool(out.last_hidden_state, mask)
     elif pooling == "cls":
@@ -122,85 +156,94 @@ def codebert_embed(
     else:
         raise ValueError(f"Unknown pooling '{pooling}'. Use 'mean' or 'cls'.")
 
-    outputs: List[torch.Tensor] = []
-    # inference_mode avoids grad overhead and is safer than no_grad for inference
+    outputs = []
     with torch.inference_mode():
-        for i in tqdm(range(0, len(texts), batch_size), desc=f"CodeBERT({pooling})"):
-            batch = texts[i : i + batch_size]
-            toks = tokenizer(
+        for start in tqdm(range(0, len(text_list), batch_size), desc=f"CodeBERT({pooling})"):
+            batch = text_list[start : start + batch_size]
+            encoded = tokenizer(
                 batch,
                 padding=True,
                 truncation=True,
                 max_length=max_len,
                 return_tensors="pt",
             ).to(device)
-
-            out = model(**toks)
-            pooled = pool_fn(out, toks["attention_mask"])  # [B, H]
+            result = model(**encoded)
+            pooled = pool_fn(result, encoded["attention_mask"])
             outputs.append(pooled.detach().to("cpu"))
 
     return torch.cat(outputs, dim=0).numpy()
 
 
-# -------------
-# I/O utilities
-# -------------
 def load_texts_from_csv(path: str, text_col: str) -> List[str]:
-    import pandas as pd  # defer import to keep base deps light
+    """Load a column of text from a CSV file as a list of strings.
+
+    Parameters
+    ----------
+    path : str
+        Path to the CSV file.
+    text_col : str
+        Name of the column containing the text to embed.
+
+    Returns
+    -------
+    List[str]
+        List of text values.
+    """
+    import pandas as pd  # local import to keep global import footprint small
     df = pd.read_csv(path)
     if text_col not in df.columns:
-        cols = ", ".join(df.columns.tolist())
-        raise ValueError(f"Column '{text_col}' not in CSV. Available: {cols}")
+        cols = ", ".join(df.columns)
+        raise ValueError(f"Column '{text_col}' not in CSV. Available columns: {cols}")
     return df[text_col].astype(str).tolist()
 
 
 def save_embeddings(out_path: str, arr: np.ndarray) -> None:
+    """Persist an embedding array to disk in either NumPy or PyTorch format."""
     out_path = str(out_path)
     Path(os.path.dirname(out_path) or ".").mkdir(parents=True, exist_ok=True)
+    # Save as .pt if extension is .pt (case‑insensitive)
     if out_path.lower().endswith(".pt"):
         torch.save(torch.from_numpy(arr), out_path)
     else:
-        # default .npy
+        # Default to .npy, adding extension if necessary
         if not out_path.lower().endswith(".npy"):
             out_path += ".npy"
         np.save(out_path, arr)
 
 
 def save_metadata(out_path: str, meta: dict) -> None:
-    meta_path = out_path
-    if meta_path.lower().endswith(".pt"):
-        meta_path = meta_path[:-3] + ".meta.json"
-    elif meta_path.lower().endswith(".npy"):
-        meta_path = meta_path[:-4] + ".meta.json"
+    """Write a JSON metadata file adjacent to the embeddings file."""
+    if out_path.lower().endswith(".pt"):
+        meta_path = out_path[:-3] + ".meta.json"
+    elif out_path.lower().endswith(".npy"):
+        meta_path = out_path[:-4] + ".meta.json"
     else:
-        meta_path = meta_path + ".meta.json"
+        meta_path = out_path + ".meta.json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
-# -----
-#  CLI
-# -----
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Extract CodeBERT embeddings from a CSV text column.")
-    p.add_argument("--input", required=True, help="Input CSV path.")
-    p.add_argument("--text-col", required=True, help="Text column to embed (e.g., values_concat).")
-    p.add_argument("--out", required=True, help="Output embeddings file (.npy or .pt).")
-
-    p.add_argument("--model", default="microsoft/codebert-base", help="HF model id.")
-    p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Compute device.")
-    p.add_argument("--batch-size", type=int, default=64, help="Batch size.")
-    p.add_argument("--max-len", type=int, default=256, help="Tokenization max length.")
-    p.add_argument("--pooling", default="mean", choices=["mean", "cls"], help="Pooling strategy.")
-    p.add_argument("--fp16", action="store_true", help="Use fp16 on CUDA.")
-    return p
+    """Construct the argument parser for the CLI."""
+    parser = argparse.ArgumentParser(description="Extract CodeBERT embeddings from a CSV column")
+    parser.add_argument("--input", required=True, help="Path to the input CSV file")
+    parser.add_argument("--text-col", required=True, help="Name of the column containing text values")
+    parser.add_argument("--out", required=True, help="Output file for embeddings (.npy or .pt)")
+    parser.add_argument("--model", default="microsoft/codebert-base", help="HuggingFace model identifier")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Device to run the model on")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for inference")
+    parser.add_argument("--max-len", type=int, default=256, help="Maximum sequence length for tokenization")
+    parser.add_argument("--pooling", choices=["mean", "cls"], default="mean", help="Pooling strategy: mean or cls")
+    parser.add_argument("--fp16", action="store_true", help="Use half precision when running on CUDA")
+    return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
-
+    # Load texts
     texts = load_texts_from_csv(args.input, args.text_col)
-    emb = codebert_embed(
+    # Compute embeddings
+    embeddings = codebert_embed(
         texts=texts,
         model_name=args.model,
         device=args.device,
@@ -209,8 +252,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         pooling=args.pooling,
         fp16=args.fp16,
     )
-
-    save_embeddings(args.out, emb)
+    # Save embeddings and metadata
+    save_embeddings(args.out, embeddings)
     save_metadata(
         args.out,
         {
@@ -218,7 +261,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "text_col": args.text_col,
             "output": args.out,
             "num_rows": len(texts),
-            "dim": int(emb.shape[1]) if emb.ndim == 2 else None,
+            "dim": int(embeddings.shape[1]) if embeddings.ndim == 2 else None,
             "model": args.model,
             "device": args.device,
             "batch_size": args.batch_size,
@@ -227,7 +270,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "fp16": bool(args.fp16),
         },
     )
-    print(f"[OK] Wrote embeddings to {args.out} (shape={emb.shape})")
+    print(f"[OK] Wrote embeddings to {args.out} (shape={embeddings.shape})")
     return 0
 
 
